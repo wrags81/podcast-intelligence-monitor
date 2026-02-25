@@ -119,6 +119,7 @@ def get_attacks():
     """Recent political attacks from right-wing podcasts."""
     try:
         with get_conn() as conn:
+            # Try last 3 days first; fall back to most recent 30 episodes if empty
             rows = conn.execute("""
                 SELECT podcast_name, title, published,
                        json_extract(analysis, '$.political_attacks') as attacks,
@@ -126,7 +127,8 @@ def get_attacks():
                 FROM episodes
                 WHERE lean = 'right'
                 AND analysis IS NOT NULL
-                AND fetched_at > datetime('now', '-3 days')
+                AND json_extract(analysis, '$.political_attacks') IS NOT NULL
+                AND json_extract(analysis, '$.political_attacks') != '[]'
                 ORDER BY fetched_at DESC
                 LIMIT 30
             """).fetchall()
@@ -149,17 +151,23 @@ def get_attacks():
         return []
 
 def get_opportunities():
-    """Messaging opportunities from recent analyses."""
+    """
+    Messaging opportunities: use messaging_opportunities if populated,
+    otherwise surface narrative themes from left/neutral podcasts as proxy.
+    """
     try:
         with get_conn() as conn:
+            # First try dedicated field
             rows = conn.execute("""
                 SELECT podcast_name, lean,
                        json_extract(analysis, '$.messaging_opportunities') as opps
                 FROM episodes
                 WHERE analysis IS NOT NULL
-                AND fetched_at > datetime('now', '-3 days')
+                AND json_extract(analysis, '$.messaging_opportunities') IS NOT NULL
+                AND json_extract(analysis, '$.messaging_opportunities') != '[]'
                 ORDER BY fetched_at DESC
             """).fetchall()
+
         results = []
         for row in rows:
             try:
@@ -168,6 +176,31 @@ def get_opportunities():
                 opps = []
             for opp in opps:
                 results.append({"podcast": row["podcast_name"], "lean": row["lean"], "opp": opp})
+
+        # Fall back: surface narrative themes from left/neutral as messaging signals
+        if not results:
+            with get_conn() as conn:
+                rows = conn.execute("""
+                    SELECT podcast_name, lean,
+                           json_extract(analysis, '$.narrative_themes') as themes
+                    FROM episodes
+                    WHERE analysis IS NOT NULL
+                    AND lean IN ('left', 'neutral')
+                    AND json_extract(analysis, '$.narrative_themes') IS NOT NULL
+                    AND json_extract(analysis, '$.narrative_themes') != '[]'
+                    ORDER BY fetched_at DESC
+                    LIMIT 20
+                """).fetchall()
+            for row in rows:
+                try:
+                    themes = json.loads(row["themes"] or "[]")
+                    if isinstance(themes, str):
+                        themes = [themes]
+                except Exception:
+                    themes = []
+                for t in themes[:2]:  # max 2 per episode
+                    results.append({"podcast": row["podcast_name"], "lean": row["lean"], "opp": t})
+
         return results[:25]
     except Exception:
         return []
@@ -204,21 +237,64 @@ def _text_matches_themes(text, themes=None):
             matched.append(theme)
     return matched
 
+def _parse_date(date_str):
+    """Parse various date formats into a datetime. Returns None on failure."""
+    if not date_str:
+        return None
+    from email.utils import parsedate_to_datetime
+    try:
+        return parsedate_to_datetime(date_str)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str[:len(fmt)+5].strip(), fmt)
+        except Exception:
+            pass
+    return None
+
 def get_campaign_intelligence(hours=72):
     """
-    Pull episodes from the last `hours` hours and surface all moments
+    Pull episodes published within the last `hours` hours and surface all moments
     relevant to the cruelty/affordability campaign themes.
+    Uses published date (not fetched_at) so seeded historical data still shows.
     Returns a list of episode dicts with filtered notable moments.
     """
     try:
+        cutoff = datetime.now(tz=None) - timedelta(hours=hours)
+        # Make cutoff timezone-naive for comparison
+        cutoff_naive = cutoff.replace(tzinfo=None)
+
         with get_conn() as conn:
             rows = conn.execute("""
                 SELECT podcast_name, lean, title, published, audio_url, analysis, fetched_at
                 FROM episodes
                 WHERE analysis IS NOT NULL
-                AND fetched_at > datetime('now', '-{} hours')
                 ORDER BY fetched_at DESC
-            """.format(hours)).fetchall()
+            """).fetchall()
+
+        # Filter in Python using robust date parsing
+        filtered = []
+        for row in rows:
+            pub = _parse_date(row["published"])
+            if pub is not None:
+                pub_naive = pub.replace(tzinfo=None)
+                if pub_naive >= cutoff_naive:
+                    filtered.append(row)
+
+        # If nothing matched published date, fall back to fetched_at filter
+        if not filtered:
+            cutoff_str = (datetime.now(tz=None) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
+            with get_conn() as conn:
+                filtered = conn.execute("""
+                    SELECT podcast_name, lean, title, published, audio_url, analysis, fetched_at
+                    FROM episodes
+                    WHERE analysis IS NOT NULL
+                    AND fetched_at > ?
+                    ORDER BY fetched_at DESC
+                """, (cutoff_str,)).fetchall()
+
+        rows = filtered
 
         results = []
         for row in rows:
@@ -378,7 +454,7 @@ def build_campaign_html(episodes, hours=72):
         <div class="camp-stats">
             <div class="camp-stat">
                 <div class="camp-stat-num">{len(episodes)}</div>
-                <div class="camp-stat-label">Relevant Episodes (72h)</div>
+                <div class="camp-stat-label">Relevant Episodes ({hours}h)</div>
             </div>
             <div class="camp-stat cruelty">
                 <div class="camp-stat-num">{cruelty_count}</div>
@@ -701,11 +777,14 @@ def build_campaign_html(episodes, hours=72):
 </header>
 
 <div class="main">
-  <div class="page-title">🎯 Campaign Intelligence — Last 72 Hours</div>
+  <div class="page-title">🎯 Campaign Intelligence — Last {hours} Hours</div>
   <div class="page-subtitle">
-    All podcast episodes from the last 72 hours surfaced for <strong>cruelty</strong> and <strong>affordability</strong> campaign themes.
-    Includes notable quotes, attacks, messaging opportunities, and narrative frames relevant to these themes.
+    All podcast episodes <strong>published in the last {hours} hours</strong> surfaced for <strong>cruelty</strong> and <strong>affordability</strong> campaign themes.
+    Includes notable quotes, political attacks, narrative frames, and direct links to source audio.
     Updated: {datetime.now().strftime('%B %d, %Y at %H:%M UTC')}
+    &nbsp;·&nbsp; <a href="/campaign?hours=168" style="color:#2c5f8a;">7 days</a>
+    &nbsp;·&nbsp; <a href="/campaign?hours=72" style="color:#2c5f8a;">72h</a>
+    &nbsp;·&nbsp; <a href="/campaign?hours=24" style="color:#2c5f8a;">24h</a>
   </div>
 
   <div class="theme-legend">
