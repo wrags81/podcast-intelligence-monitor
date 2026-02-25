@@ -802,7 +802,6 @@ def build_campaign_html(episodes, hours=72):
 <body>
 <header>
   <div class="logo">
-    <div class="logo-mark">P</div>
     <div>
       <div class="logo-text">Podcast Intelligence Dashboard</div>
       <div class="logo-sub">Political Media Monitor</div>
@@ -1135,7 +1134,6 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None, episo
 
 <header>
   <div class="logo">
-    <div class="logo-mark">P</div>
     <div>
       <div class="logo-text">Podcast Intelligence Dashboard</div>
       <div class="logo-sub">Political Media Monitor</div>
@@ -1635,7 +1633,6 @@ def build_right_dashboard_html(data, hours=None):
 <body>
 <header>
   <div class="logo">
-    <div class="logo-mark">R</div>
     <div>
       <div class="logo-text">Right-Wing Podcast Monitor</div>
       <div class="logo-sub">Political Media Intelligence</div>
