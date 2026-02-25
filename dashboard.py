@@ -115,12 +115,12 @@ def get_daily_volume(days=14):
     except Exception:
         return {}
 
-def get_attacks():
-    """Recent political attacks from right-wing podcasts."""
+def get_attacks(hours=None):
+    """Recent political attacks from right-wing podcasts. hours=None means all time."""
     try:
+        time_clause = f"AND fetched_at > datetime('now', '-{hours} hours')" if hours else ""
         with get_conn() as conn:
-            # Try last 3 days first; fall back to most recent 30 episodes if empty
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT podcast_name, title, published,
                        json_extract(analysis, '$.political_attacks') as attacks,
                        json_extract(analysis, '$.threat_level') as threat_level
@@ -129,6 +129,7 @@ def get_attacks():
                 AND analysis IS NOT NULL
                 AND json_extract(analysis, '$.political_attacks') IS NOT NULL
                 AND json_extract(analysis, '$.political_attacks') != '[]'
+                {time_clause}
                 ORDER BY fetched_at DESC
                 LIMIT 30
             """).fetchall()
@@ -150,21 +151,23 @@ def get_attacks():
     except Exception:
         return []
 
-def get_opportunities():
+def get_opportunities(hours=None):
     """
     Messaging opportunities: use messaging_opportunities if populated,
     otherwise surface narrative themes from left/neutral podcasts as proxy.
+    hours=None means all time.
     """
     try:
+        time_clause = f"AND fetched_at > datetime('now', '-{hours} hours')" if hours else ""
         with get_conn() as conn:
-            # First try dedicated field
-            rows = conn.execute("""
+            rows = conn.execute(f"""
                 SELECT podcast_name, lean,
                        json_extract(analysis, '$.messaging_opportunities') as opps
                 FROM episodes
                 WHERE analysis IS NOT NULL
                 AND json_extract(analysis, '$.messaging_opportunities') IS NOT NULL
                 AND json_extract(analysis, '$.messaging_opportunities') != '[]'
+                {time_clause}
                 ORDER BY fetched_at DESC
             """).fetchall()
 
@@ -180,7 +183,7 @@ def get_opportunities():
         # Fall back: surface narrative themes from left/neutral as messaging signals
         if not results:
             with get_conn() as conn:
-                rows = conn.execute("""
+                rows = conn.execute(f"""
                     SELECT podcast_name, lean,
                            json_extract(analysis, '$.narrative_themes') as themes
                     FROM episodes
@@ -188,6 +191,7 @@ def get_opportunities():
                     AND lean IN ('left', 'neutral')
                     AND json_extract(analysis, '$.narrative_themes') IS NOT NULL
                     AND json_extract(analysis, '$.narrative_themes') != '[]'
+                    {time_clause}
                     ORDER BY fetched_at DESC
                     LIMIT 20
                 """).fetchall()
@@ -807,7 +811,35 @@ def build_campaign_html(episodes, hours=72):
 
 
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
-def build_dashboard_html(stats, topics, volume, attacks, opps):
+def _timeframe_tabs(base_url, current_hours, accent_color="#e8333c"):
+    """Render 24h / 72h / 7d / All Time tab strip."""
+    tabs = [("24h", 24), ("72h", 72), ("7 days", 168), ("All Time", None)]
+    html = '<div style="display:flex;gap:6px;align-items:center;margin-bottom:20px;flex-wrap:wrap;">'
+    html += '<span style="font-family:sans-serif;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin-right:6px;">Show:</span>'
+    for label, h in tabs:
+        url = f"{base_url}?hours={h}" if h else base_url
+        is_active = current_hours == h
+        if is_active:
+            style = f"background:{accent_color};color:white;border:1px solid {accent_color};"
+        else:
+            style = "background:white;color:#1a3a5c;border:1px solid #e2e5ea;"
+        html += f'<a href="{url}" style="{style}font-family:sans-serif;font-size:12px;font-weight:bold;padding:5px 14px;border-radius:20px;text-decoration:none;">{label}</a>'
+    html += "</div>"
+    return html
+
+def _hours_label(hours):
+    """Human-readable label for a timeframe."""
+    if hours is None:
+        return "All Time"
+    if hours == 24:
+        return "24h"
+    if hours == 72:
+        return "72h"
+    if hours == 168:
+        return "7 days"
+    return f"{hours}h"
+
+def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
     topic_labels = [t[0] for t in topics[:12]]
     topic_values = [t[1] for t in topics[:12]]
     
@@ -1114,6 +1146,7 @@ def build_dashboard_html(stats, topics, volume, attacks, opps):
   </div>
 
   <p class="section-label">Intelligence Feed</p>
+  {_timeframe_tabs("/", hours)}
 
   <div class="grid-2">
     <!-- Right-wing attacks -->
@@ -1121,12 +1154,12 @@ def build_dashboard_html(stats, topics, volume, attacks, opps):
       <div class="panel-header">
         <div class="panel-dot"></div>
         <div>
-          <div class="panel-title">🚨 Right-Wing Attacks (72h)</div>
+          <div class="panel-title">🚨 Right-Wing Attacks ({_hours_label(hours)})</div>
           <div class="panel-subtitle">Attacks requiring counter-messaging</div>
         </div>
       </div>
       <div class="panel-body scrollable">
-        {attacks_html if attacks_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No high-signal attacks found in last 72h. Run analyzer to populate.</p>'}
+        {attacks_html if attacks_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No attacks found for this timeframe.</p>'}
       </div>
     </div>
 
@@ -1135,12 +1168,12 @@ def build_dashboard_html(stats, topics, volume, attacks, opps):
       <div class="panel-header">
         <div class="panel-dot" style="background:#2a9d8f;"></div>
         <div>
-          <div class="panel-title">💡 Messaging Opportunities (72h)</div>
+          <div class="panel-title">💡 Messaging Opportunities ({_hours_label(hours)})</div>
           <div class="panel-subtitle">Issues to go on offense with</div>
         </div>
       </div>
       <div class="panel-body scrollable">
-        {opps_html if opps_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No opportunities found yet. Run analyzer to populate.</p>'}
+        {opps_html if opps_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No opportunities found for this timeframe.</p>'}
       </div>
     </div>
   </div>
@@ -1294,21 +1327,25 @@ new Chart(document.getElementById('leanPieChart'), {{
 </html>"""
 
 # ── Right-Wing Dashboard ───────────────────────────────────────────────────────
-def get_right_wing_data():
+def get_right_wing_data(hours=None):
+  """hours=None means all time."""
   try:
+    time_clause = f"AND fetched_at > datetime('now', '-{hours} hours')" if hours else ""
     with get_conn() as conn:
-        episodes = conn.execute("""
-            SELECT podcast_name, title, published, analysis, fetched_at
+        episodes = conn.execute(f"""
+            SELECT podcast_name, title, published, analysis, audio_url, fetched_at
             FROM episodes
             WHERE lean = 'right' AND analysis IS NOT NULL
+            {time_clause}
             ORDER BY fetched_at DESC
         """).fetchall()
 
-        per_show = conn.execute("""
+        per_show = conn.execute(f"""
             SELECT podcast_name, COUNT(*) as cnt,
                    SUM(CASE WHEN json_extract(analysis,'$.threat_level')='high' THEN 1 ELSE 0 END) as high_cnt
             FROM episodes
             WHERE lean = 'right' AND analysis IS NOT NULL
+            {time_clause}
             GROUP BY podcast_name
             ORDER BY cnt DESC
         """).fetchall()
@@ -1358,7 +1395,7 @@ def get_right_wing_data():
     return {"episodes": [], "per_show": [], "top_topics": [], "quotes": [], "attacks": []}
 
 
-def build_right_dashboard_html(data):
+def build_right_dashboard_html(data, hours=None):
     def threat_color(level):
         return {"high": "#e8333c", "medium": "#f0a500", "low": "#2a9d8f"}.get(level, "#888")
 
@@ -1525,17 +1562,18 @@ def build_right_dashboard_html(data):
   </div>
 
   <p class="section-label">Volume &amp; Topics</p>
+  {_timeframe_tabs("/right", hours, accent_color="#8b0000")}
   <div class="grid-2">
     <div class="panel">
       <div class="panel-header">
-        <div><div class="panel-title">Episodes by Show</div>
-        <div class="panel-subtitle">Top 10 most active right-wing podcasts</div></div>
+        <div><div class="panel-title">Episodes by Show ({_hours_label(hours)})</div>
+        <div class="panel-subtitle">Most active right-wing podcasts</div></div>
       </div>
       <div class="panel-body"><canvas id="showChart"></canvas></div>
     </div>
     <div class="panel">
       <div class="panel-header">
-        <div><div class="panel-title">Top Topics (Right-Wing Only)</div>
+        <div><div class="panel-title">Top Topics — Right-Wing ({_hours_label(hours)})</div>
         <div class="panel-subtitle">Most discussed subjects</div></div>
       </div>
       <div class="panel-body"><canvas id="topicsChart"></canvas></div>
@@ -1545,7 +1583,7 @@ def build_right_dashboard_html(data):
   <p class="section-label">Notable Quotes &amp; Clips</p>
   <div class="panel">
     <div class="panel-header">
-      <div><div class="panel-title">Clippable Moments</div>
+      <div><div class="panel-title">Clippable Moments ({_hours_label(hours)})</div>
         <div class="panel-subtitle">Quotes flagged for political significance</div></div>
     </div>
     <div class="panel-body scrollable">
@@ -1556,22 +1594,22 @@ def build_right_dashboard_html(data):
   <p class="section-label">Attack Feed</p>
   <div class="panel">
     <div class="panel-header">
-      <div><div class="panel-title">Political Attacks on Democrats &amp; Progressives</div>
-        <div class="panel-subtitle">All attacks extracted from right-wing episodes</div></div>
+      <div><div class="panel-title">Political Attacks ({_hours_label(hours)})</div>
+        <div class="panel-subtitle">Attacks on Democrats &amp; progressives extracted from right-wing episodes</div></div>
     </div>
     <div class="panel-body scrollable">
-      {attacks_html or '<p style="color:#888;font-family:sans-serif;font-size:13px;">No attacks found yet.</p>'}
+      {attacks_html or '<p style="color:#888;font-family:sans-serif;font-size:13px;">No attacks found for this timeframe.</p>'}
     </div>
   </div>
 
   <p class="section-label">Episode Rundown</p>
   <div class="panel">
     <div class="panel-header">
-      <div><div class="panel-title">All Right-Wing Episodes</div>
+      <div><div class="panel-title">Right-Wing Episodes ({_hours_label(hours)})</div>
         <div class="panel-subtitle">Most recent first</div></div>
     </div>
     <div class="panel-body scrollable">
-      {episodes_html or '<p style="color:#888;font-family:sans-serif;font-size:13px;">No episodes yet.</p>'}
+      {episodes_html or '<p style="color:#888;font-family:sans-serif;font-size:13px;">No episodes for this timeframe.</p>'}
     </div>
   </div>
 </div>
@@ -1616,19 +1654,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
+        qs = parse_qs(parsed.query)
+        hours_raw = qs.get("hours", [None])[0]
+        hours = int(hours_raw) if hours_raw else None
+
         if parsed.path == "/right":
-            data = get_right_wing_data()
-            html = build_right_dashboard_html(data)
+            data = get_right_wing_data(hours=hours)
+            html = build_right_dashboard_html(data, hours=hours)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(html.encode())
 
         elif parsed.path == "/campaign":
-            qs = parse_qs(parsed.query)
-            hours = int(qs.get("hours", ["72"])[0])
-            episodes = get_campaign_intelligence(hours=hours)
-            html = build_campaign_html(episodes, hours=hours)
+            camp_hours = hours if hours else 72
+            episodes = get_campaign_intelligence(hours=camp_hours)
+            html = build_campaign_html(episodes, hours=camp_hours)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -1638,9 +1679,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             stats = get_stats()
             topics = get_trending_topics()
             volume = get_daily_volume()
-            attacks = get_attacks()
-            opps = get_opportunities()
-            html = build_dashboard_html(stats, topics, volume, attacks, opps)
+            attacks = get_attacks(hours=hours)
+            opps = get_opportunities(hours=hours)
+            html = build_dashboard_html(stats, topics, volume, attacks, opps, hours=hours)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
