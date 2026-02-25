@@ -1,0 +1,15 @@
+{
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 465,
+    "username": "you@example.com",
+    "password": "your-app-password",
+    "from": "Podcast Monitor <you@example.com>"
+  },
+  "recipients": [
+    "recipient@example.com"
+  ],
+  "transcript_apis": {
+    "taddy": ""
+  }
+}

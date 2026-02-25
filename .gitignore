@@ -1,0 +1,42 @@
+# Database — contains analysis data, not for version control
+data/episodes.db
+data/*.db
+
+# Config — contains SMTP credentials and API keys
+config.json
+
+# API keys and secrets
+.env
+*.env
+
+# Generated output (digests, CSVs) — large and frequently changing
+output/digest_*.html
+output/digest_*.txt
+output/podcasts.csv
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
