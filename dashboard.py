@@ -23,127 +23,154 @@ DB_PATH = DATA_DIR / "episodes.db"
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Ensure tables exist even if DB is fresh
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT PRIMARY KEY,
+            podcast_name TEXT,
+            lean TEXT,
+            title TEXT,
+            published TEXT,
+            description TEXT,
+            audio_url TEXT,
+            transcript TEXT,
+            analysis TEXT,
+            fetched_at TEXT,
+            digest_included INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
     return conn
 
 def get_stats():
-    with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
-        analyzed = conn.execute("SELECT COUNT(*) FROM episodes WHERE analysis IS NOT NULL").fetchone()[0]
-        by_lean = conn.execute(
-            "SELECT lean, COUNT(*) as cnt FROM episodes GROUP BY lean"
-        ).fetchall()
-        recent = conn.execute("""
-            SELECT podcast_name, lean, title, published, analysis
-            FROM episodes
-            WHERE analysis IS NOT NULL
-            ORDER BY fetched_at DESC
-            LIMIT 20
-        """).fetchall()
-        threats = conn.execute("""
-            SELECT json_extract(analysis, '$.threat_level') as tl, COUNT(*) as cnt
-            FROM episodes WHERE analysis IS NOT NULL
-            GROUP BY tl
-        """).fetchall()
-    return {
-        "total": total,
-        "analyzed": analyzed,
-        "by_lean": {r["lean"]: r["cnt"] for r in by_lean},
-        "recent": [dict(r) for r in recent],
-        "threats": {r["tl"]: r["cnt"] for r in threats},
-    }
+    try:
+        with get_conn() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+            analyzed = conn.execute("SELECT COUNT(*) FROM episodes WHERE analysis IS NOT NULL").fetchone()[0]
+            by_lean = conn.execute(
+                "SELECT lean, COUNT(*) as cnt FROM episodes GROUP BY lean"
+            ).fetchall()
+            recent = conn.execute("""
+                SELECT podcast_name, lean, title, published, analysis
+                FROM episodes
+                WHERE analysis IS NOT NULL
+                ORDER BY fetched_at DESC
+                LIMIT 20
+            """).fetchall()
+            threats = conn.execute("""
+                SELECT json_extract(analysis, '$.threat_level') as tl, COUNT(*) as cnt
+                FROM episodes WHERE analysis IS NOT NULL
+                GROUP BY tl
+            """).fetchall()
+        return {
+            "total": total,
+            "analyzed": analyzed,
+            "by_lean": {r["lean"]: r["cnt"] for r in by_lean},
+            "recent": [dict(r) for r in recent],
+            "threats": {r["tl"]: r["cnt"] for r in threats},
+        }
+    except Exception:
+        return {"total": 0, "analyzed": 0, "by_lean": {}, "recent": [], "threats": {}}
 
 def get_trending_topics():
     """Extract top topics from recent analyses."""
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT analysis FROM episodes
-            WHERE analysis IS NOT NULL
-            AND fetched_at > datetime('now', '-7 days')
-        """).fetchall()
-    
-    topic_counts = {}
-    for row in rows:
-        try:
-            analysis = json.loads(row["analysis"])
-            for topic in analysis.get("key_topics", []):
-                topic = topic.lower().strip()
-                topic_counts[topic] = topic_counts.get(topic, 0) + 1
-        except Exception:
-            continue
-    
-    return sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT analysis FROM episodes
+                WHERE analysis IS NOT NULL
+                AND fetched_at > datetime('now', '-7 days')
+            """).fetchall()
+        topic_counts = {}
+        for row in rows:
+            try:
+                analysis = json.loads(row["analysis"])
+                for topic in analysis.get("key_topics", []):
+                    topic = topic.lower().strip()
+                    topic_counts[topic] = topic_counts.get(topic, 0) + 1
+            except Exception:
+                continue
+        return sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+    except Exception:
+        return []
 
 def get_daily_volume(days=14):
     """Episode count by day and lean."""
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT date(fetched_at) as day, lean, COUNT(*) as cnt
-            FROM episodes
-            WHERE fetched_at > datetime('now', '-{} days')
-            GROUP BY day, lean
-            ORDER BY day
-        """.format(days)).fetchall()
-    
-    data = {}
-    for row in rows:
-        day = row["day"]
-        if day not in data:
-            data[day] = {"left": 0, "right": 0, "neutral": 0}
-        data[day][row["lean"]] = row["cnt"]
-    return data
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT date(fetched_at) as day, lean, COUNT(*) as cnt
+                FROM episodes
+                WHERE fetched_at > datetime('now', '-{} days')
+                GROUP BY day, lean
+                ORDER BY day
+            """.format(days)).fetchall()
+        data = {}
+        for row in rows:
+            day = row["day"]
+            if day not in data:
+                data[day] = {"left": 0, "right": 0, "neutral": 0}
+            data[day][row["lean"]] = row["cnt"]
+        return data
+    except Exception:
+        return {}
 
 def get_attacks():
     """Recent political attacks from right-wing podcasts."""
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT podcast_name, title, published,
-                   json_extract(analysis, '$.political_attacks') as attacks,
-                   json_extract(analysis, '$.threat_level') as threat_level
-            FROM episodes
-            WHERE lean = 'right'
-            AND analysis IS NOT NULL
-            AND fetched_at > datetime('now', '-3 days')
-            ORDER BY fetched_at DESC
-            LIMIT 30
-        """).fetchall()
-    
-    results = []
-    for row in rows:
-        try:
-            attacks = json.loads(row["attacks"] or "[]")
-        except Exception:
-            attacks = []
-        if attacks:
-            results.append({
-                "podcast": row["podcast_name"],
-                "title": row["title"],
-                "published": row["published"],
-                "attacks": attacks,
-                "threat_level": row["threat_level"],
-            })
-    return results
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT podcast_name, title, published,
+                       json_extract(analysis, '$.political_attacks') as attacks,
+                       json_extract(analysis, '$.threat_level') as threat_level
+                FROM episodes
+                WHERE lean = 'right'
+                AND analysis IS NOT NULL
+                AND fetched_at > datetime('now', '-3 days')
+                ORDER BY fetched_at DESC
+                LIMIT 30
+            """).fetchall()
+        results = []
+        for row in rows:
+            try:
+                attacks = json.loads(row["attacks"] or "[]")
+            except Exception:
+                attacks = []
+            if attacks:
+                results.append({
+                    "podcast": row["podcast_name"],
+                    "title": row["title"],
+                    "published": row["published"],
+                    "attacks": attacks,
+                    "threat_level": row["threat_level"],
+                })
+        return results
+    except Exception:
+        return []
 
 def get_opportunities():
     """Messaging opportunities from recent analyses."""
-    with get_conn() as conn:
-        rows = conn.execute("""
-            SELECT podcast_name, lean,
-                   json_extract(analysis, '$.messaging_opportunities') as opps
-            FROM episodes
-            WHERE analysis IS NOT NULL
-            AND fetched_at > datetime('now', '-3 days')
-            ORDER BY fetched_at DESC
-        """).fetchall()
-    
-    results = []
-    for row in rows:
-        try:
-            opps = json.loads(row["opps"] or "[]")
-        except Exception:
-            opps = []
-        for opp in opps:
-            results.append({"podcast": row["podcast_name"], "lean": row["lean"], "opp": opp})
-    return results[:25]
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT podcast_name, lean,
+                       json_extract(analysis, '$.messaging_opportunities') as opps
+                FROM episodes
+                WHERE analysis IS NOT NULL
+                AND fetched_at > datetime('now', '-3 days')
+                ORDER BY fetched_at DESC
+            """).fetchall()
+        results = []
+        for row in rows:
+            try:
+                opps = json.loads(row["opps"] or "[]")
+            except Exception:
+                opps = []
+            for opp in opps:
+                results.append({"podcast": row["podcast_name"], "lean": row["lean"], "opp": opp})
+        return results[:25]
+    except Exception:
+        return []
 
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
 def build_dashboard_html(stats, topics, volume, attacks, opps):
@@ -594,6 +621,7 @@ new Chart(document.getElementById('leanPieChart'), {{
 
 # ── Right-Wing Dashboard ───────────────────────────────────────────────────────
 def get_right_wing_data():
+  try:
     with get_conn() as conn:
         episodes = conn.execute("""
             SELECT podcast_name, title, published, analysis, fetched_at
@@ -652,6 +680,8 @@ def get_right_wing_data():
         "quotes": quotes[:20],
         "attacks": attacks_all[:30],
     }
+  except Exception:
+    return {"episodes": [], "per_show": [], "top_topics": [], "quotes": [], "attacks": []}
 
 
 def build_right_dashboard_html(data):
