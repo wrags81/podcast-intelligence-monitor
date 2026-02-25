@@ -172,6 +172,561 @@ def get_opportunities():
     except Exception:
         return []
 
+# Campaign theme keywords
+CAMPAIGN_KEYWORDS = {
+    "cruelty": [
+        "cruelty", "cruel", "heartless", "inhumane", "suffering", "punish",
+        "harm", "hurt", "cut", "strip", "deny", "rip away", "slash", "brutal",
+        "vicious", "callous", "merciless", "pain", "devastate", "abandon",
+        "medicaid", "snap", "food stamps", "disability", "veterans benefits",
+        "deportation", "family separation", "children", "vulnerable",
+    ],
+    "affordability": [
+        "afford", "affordability", "cost", "price", "expense", "expensive",
+        "housing", "rent", "mortgage", "healthcare", "prescription", "drug price",
+        "grocery", "food", "inflation", "wage", "salary", "income", "debt",
+        "student loan", "childcare", "utilities", "insurance", "copay",
+        "out of pocket", "middle class", "working family", "paycheck",
+        "tariff", "tax cut", "billionaire", "corporate", "profit",
+    ],
+}
+
+def _text_matches_themes(text, themes=None):
+    """Return which campaign themes a text string matches."""
+    if not text:
+        return []
+    text_lower = text.lower()
+    if themes is None:
+        themes = list(CAMPAIGN_KEYWORDS.keys())
+    matched = []
+    for theme in themes:
+        if any(kw in text_lower for kw in CAMPAIGN_KEYWORDS[theme]):
+            matched.append(theme)
+    return matched
+
+def get_campaign_intelligence(hours=72):
+    """
+    Pull episodes from the last `hours` hours and surface all moments
+    relevant to the cruelty/affordability campaign themes.
+    Returns a list of episode dicts with filtered notable moments.
+    """
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT podcast_name, lean, title, published, audio_url, analysis, fetched_at
+                FROM episodes
+                WHERE analysis IS NOT NULL
+                AND fetched_at > datetime('now', '-{} hours')
+                ORDER BY fetched_at DESC
+            """.format(hours)).fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                a = json.loads(row["analysis"])
+            except Exception:
+                continue
+
+            ep_themes = set()
+            moments = []
+
+            # Check synopsis / narrative themes
+            synopsis = a.get("synopsis", "") or a.get("one_liner", "")
+            narrative_themes = a.get("narrative_themes", [])
+            if isinstance(narrative_themes, str):
+                narrative_themes = [narrative_themes]
+
+            # Check key topics
+            for topic in (a.get("key_topics") or []):
+                t = _text_matches_themes(topic)
+                ep_themes.update(t)
+
+            # Notable quotes
+            for q in (a.get("notable_quotes") or []):
+                quote_text = q.get("quote", "") if isinstance(q, dict) else str(q)
+                context = q.get("context", "") if isinstance(q, dict) else ""
+                combined = f"{quote_text} {context}"
+                matched = _text_matches_themes(combined)
+                if matched:
+                    ep_themes.update(matched)
+                    moments.append({
+                        "type": "quote",
+                        "themes": matched,
+                        "text": quote_text,
+                        "speaker": q.get("speaker", "") if isinstance(q, dict) else "",
+                        "context": context,
+                        "badge": (q.get("type", "") if isinstance(q, dict) else "").replace("_", " "),
+                    })
+
+            # Political attacks
+            for atk in (a.get("political_attacks") or []):
+                atk_text = atk if isinstance(atk, str) else str(atk)
+                matched = _text_matches_themes(atk_text)
+                if matched:
+                    ep_themes.update(matched)
+                    moments.append({
+                        "type": "attack",
+                        "themes": matched,
+                        "text": atk_text,
+                        "speaker": "",
+                        "context": "",
+                        "badge": "attack",
+                    })
+
+            # Messaging opportunities
+            for opp in (a.get("messaging_opportunities") or []):
+                opp_text = opp if isinstance(opp, str) else str(opp)
+                matched = _text_matches_themes(opp_text)
+                if matched:
+                    ep_themes.update(matched)
+                    moments.append({
+                        "type": "opportunity",
+                        "themes": matched,
+                        "text": opp_text,
+                        "speaker": "",
+                        "context": "",
+                        "badge": "opportunity",
+                    })
+
+            # Narrative themes
+            for nt in narrative_themes:
+                matched = _text_matches_themes(nt)
+                if matched:
+                    ep_themes.update(matched)
+                    moments.append({
+                        "type": "narrative",
+                        "themes": matched,
+                        "text": nt,
+                        "speaker": "",
+                        "context": "",
+                        "badge": "narrative frame",
+                    })
+
+            # Also check synopsis itself
+            synopsis_themes = _text_matches_themes(synopsis)
+            ep_themes.update(synopsis_themes)
+
+            # Only include episodes with at least one campaign-relevant moment
+            # OR whose synopsis/topics clearly match
+            if ep_themes or moments:
+                # Even if no specific moments flagged, include episode if synopsis matches
+                if not moments and synopsis_themes:
+                    moments.append({
+                        "type": "synopsis",
+                        "themes": synopsis_themes,
+                        "text": synopsis,
+                        "speaker": "",
+                        "context": "",
+                        "badge": "episode summary",
+                    })
+
+                pub = row["published"] or row["fetched_at"] or ""
+                results.append({
+                    "podcast": row["podcast_name"],
+                    "lean": row["lean"],
+                    "title": row["title"] or "(Untitled)",
+                    "published": pub[:16] if pub else "",
+                    "audio_url": row["audio_url"] or "",
+                    "synopsis": synopsis,
+                    "threat": a.get("threat_level", "low"),
+                    "themes": sorted(ep_themes),
+                    "moments": moments,
+                    "topics": (a.get("key_topics") or [])[:5],
+                })
+
+        return results
+    except Exception as e:
+        return []
+
+# ── Campaign Intelligence HTML ──────────────────────────────────────────────────
+def build_campaign_html(episodes, hours=72):
+    def lean_color(lean):
+        return {"left": "#2a9d8f", "right": "#e8333c", "neutral": "#555"}.get(lean, "#888")
+
+    def threat_color(level):
+        return {"high": "#e8333c", "medium": "#f0a500", "low": "#2a9d8f"}.get(level, "#888")
+
+    def theme_pill(theme):
+        colors = {"cruelty": "#7c1d1d", "affordability": "#1a3a5c"}
+        bg = colors.get(theme, "#555")
+        return f'<span class="theme-pill" style="background:{bg};">{theme.upper()}</span>'
+
+    def moment_type_style(mtype):
+        return {
+            "quote": ("#7c3aed", "💬"),
+            "attack": ("#e8333c", "🚨"),
+            "opportunity": ("#2a9d8f", "💡"),
+            "narrative": ("#f0a500", "📣"),
+            "synopsis": ("#2c5f8a", "📋"),
+        }.get(mtype, ("#888", "•"))
+
+    if not episodes:
+        body = """
+        <div class="empty-state">
+            <div style="font-size:48px;margin-bottom:16px;">📭</div>
+            <p>No episodes with cruelty or affordability signals found in the last 72 hours.</p>
+            <p style="font-size:13px;margin-top:8px;color:#888;">Run the pipeline to fetch and analyze new episodes: <code>python monitor.py run-all</code></p>
+        </div>"""
+    else:
+        # Count by theme
+        cruelty_count = sum(1 for e in episodes if "cruelty" in e["themes"])
+        afford_count = sum(1 for e in episodes if "affordability" in e["themes"])
+        both_count = sum(1 for e in episodes if "cruelty" in e["themes"] and "affordability" in e["themes"])
+        high_threat = sum(1 for e in episodes if e["threat"] == "high")
+
+        stats_strip = f"""
+        <div class="camp-stats">
+            <div class="camp-stat">
+                <div class="camp-stat-num">{len(episodes)}</div>
+                <div class="camp-stat-label">Relevant Episodes (72h)</div>
+            </div>
+            <div class="camp-stat cruelty">
+                <div class="camp-stat-num">{cruelty_count}</div>
+                <div class="camp-stat-label">Cruelty Theme</div>
+            </div>
+            <div class="camp-stat afford">
+                <div class="camp-stat-num">{afford_count}</div>
+                <div class="camp-stat-label">Affordability Theme</div>
+            </div>
+            <div class="camp-stat both">
+                <div class="camp-stat-num">{both_count}</div>
+                <div class="camp-stat-label">Both Themes</div>
+            </div>
+            <div class="camp-stat threat">
+                <div class="camp-stat-num">{high_threat}</div>
+                <div class="camp-stat-label">High Threat</div>
+            </div>
+        </div>"""
+
+        episodes_html = ""
+        for ep in episodes:
+            lc = lean_color(ep["lean"])
+            tc = threat_color(ep["threat"])
+            theme_pills = "".join(theme_pill(t) for t in ep["themes"])
+            link_html = (
+                f'<a href="{ep["audio_url"]}" class="ep-link" target="_blank" rel="noopener">🔗 Listen</a>'
+                if ep["audio_url"] else ""
+            )
+            topics_str = " · ".join(ep["topics"]) if ep["topics"] else ""
+
+            moments_html = ""
+            for m in ep["moments"]:
+                mcolor, micon = moment_type_style(m["type"])
+                mpills = "".join(theme_pill(t) for t in m["themes"])
+                speaker_html = f'<span class="moment-speaker">— {m["speaker"]}</span>' if m.get("speaker") else ""
+                context_html = f'<div class="moment-context">{m["context"]}</div>' if m.get("context") else ""
+                badge_html = f'<span class="moment-badge" style="background:{mcolor};">{micon} {m["badge"].upper() or m["type"].upper()}</span>' if m.get("badge") or m.get("type") else ""
+                moments_html += f"""
+                <div class="moment" style="border-left-color:{mcolor};">
+                    <div class="moment-header">
+                        {badge_html}
+                        {mpills}
+                    </div>
+                    <div class="moment-text">{'&ldquo;' if m['type']=='quote' else ''}{m['text']}{'&rdquo;' if m['type']=='quote' else ''}</div>
+                    {speaker_html}
+                    {context_html}
+                </div>"""
+
+            episodes_html += f"""
+            <div class="ep-card">
+                <div class="ep-card-header">
+                    <div class="ep-meta-left">
+                        <span class="lean-badge" style="background:{lc};">{ep['lean'].upper()}</span>
+                        <span class="threat-badge" style="background:{tc};">{ep['threat'].upper()} THREAT</span>
+                        {theme_pills}
+                    </div>
+                    <div class="ep-meta-right">
+                        <span class="ep-date">📅 {ep['published'] or 'Date unknown'}</span>
+                        {link_html}
+                    </div>
+                </div>
+                <div class="ep-podcast">{ep['podcast']}</div>
+                <div class="ep-title">"{ep['title']}"</div>
+                {f'<div class="ep-topics">Topics: {topics_str}</div>' if topics_str else ''}
+                {f'<div class="ep-synopsis">{ep["synopsis"]}</div>' if ep["synopsis"] else ''}
+                <div class="moments-section">
+                    <div class="moments-label">CAMPAIGN-RELEVANT MOMENTS</div>
+                    {moments_html if moments_html else '<div class="no-moments">Episode matches on topic/summary level — run with full transcripts for deeper extraction.</div>'}
+                </div>
+            </div>"""
+
+        body = stats_strip + episodes_html
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Campaign Intelligence — Cruelty &amp; Affordability</title>
+<style>
+  :root {{
+    --navy: #1a3a5c;
+    --red: #e8333c;
+    --teal: #2a9d8f;
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --border: #e2e5ea;
+    --text: #1a1a2e;
+    --muted: #6b7280;
+    --cruelty: #7c1d1d;
+    --afford: #1a3a5c;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Georgia, serif; background: var(--bg); color: var(--text); }}
+  header {{
+    background: var(--navy);
+    color: white;
+    padding: 0 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 64px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    position: sticky; top: 0; z-index: 100;
+  }}
+  .logo {{ display: flex; align-items: center; gap: 14px; }}
+  .logo-mark {{
+    width: 36px; height: 36px;
+    background: var(--red);
+    border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: bold; font-size: 18px; color: white; font-family: sans-serif;
+  }}
+  .logo-text {{ font-size: 15px; font-weight: bold; }}
+  .logo-sub {{ font-size: 11px; color: #7fb3d3; letter-spacing: 1px; text-transform: uppercase; }}
+  .header-nav {{ display: flex; gap: 24px; align-items: center; }}
+  .nav-link {{ color: #a8cce0; font-family: sans-serif; font-size: 13px; text-decoration: none; }}
+  .nav-link:hover {{ color: white; }}
+  .nav-link.active {{ color: white; font-weight: bold; border-bottom: 2px solid var(--red); padding-bottom: 2px; }}
+
+  .main {{ max-width: 1100px; margin: 0 auto; padding: 28px 24px; }}
+
+  .page-title {{
+    font-size: 22px;
+    font-weight: bold;
+    color: var(--navy);
+    margin-bottom: 6px;
+  }}
+  .page-subtitle {{
+    font-family: sans-serif;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 28px;
+    line-height: 1.6;
+  }}
+  .theme-legend {{
+    display: flex;
+    gap: 12px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }}
+  .legend-item {{
+    display: flex; align-items: center; gap: 8px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-family: sans-serif;
+    font-size: 12px;
+  }}
+  .legend-dot {{ width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }}
+  .legend-label {{ font-weight: bold; }}
+  .legend-desc {{ color: var(--muted); margin-left: 4px; }}
+
+  /* Stats */
+  .camp-stats {{
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 14px;
+    margin-bottom: 28px;
+  }}
+  .camp-stat {{
+    background: var(--card);
+    border-radius: 10px;
+    padding: 18px;
+    border: 1px solid var(--border);
+    text-align: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+  }}
+  .camp-stat-num {{
+    font-size: 32px;
+    font-weight: bold;
+    color: var(--navy);
+    line-height: 1;
+    margin-bottom: 6px;
+  }}
+  .camp-stat-label {{ font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; font-family: sans-serif; }}
+  .camp-stat.cruelty .camp-stat-num {{ color: var(--cruelty); }}
+  .camp-stat.afford .camp-stat-num {{ color: var(--afford); }}
+  .camp-stat.both .camp-stat-num {{ color: #7c3aed; }}
+  .camp-stat.threat .camp-stat-num {{ color: var(--red); }}
+
+  /* Episode cards */
+  .ep-card {{
+    background: var(--card);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    margin-bottom: 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    overflow: hidden;
+  }}
+  .ep-card-header {{
+    padding: 14px 20px;
+    background: #f8f9fb;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }}
+  .ep-meta-left {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .ep-meta-right {{ display: flex; align-items: center; gap: 14px; }}
+  .lean-badge, .threat-badge {{
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 10px;
+    color: white;
+    font-family: sans-serif;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+  }}
+  .theme-pill {{
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 10px;
+    color: white;
+    font-family: sans-serif;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+  }}
+  .ep-date {{ font-family: sans-serif; font-size: 12px; color: var(--muted); }}
+  .ep-link {{
+    font-family: sans-serif;
+    font-size: 12px;
+    color: var(--navy);
+    text-decoration: none;
+    font-weight: bold;
+    padding: 4px 10px;
+    border: 1px solid var(--navy);
+    border-radius: 4px;
+  }}
+  .ep-link:hover {{ background: var(--navy); color: white; }}
+  .ep-podcast {{
+    font-family: sans-serif;
+    font-size: 12px;
+    font-weight: bold;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 14px 20px 4px;
+  }}
+  .ep-title {{
+    font-size: 16px;
+    font-weight: bold;
+    color: var(--navy);
+    padding: 0 20px 8px;
+    line-height: 1.4;
+  }}
+  .ep-topics {{
+    font-family: sans-serif;
+    font-size: 11px;
+    color: var(--muted);
+    padding: 0 20px 8px;
+  }}
+  .ep-synopsis {{
+    font-size: 13px;
+    color: #444;
+    line-height: 1.7;
+    padding: 0 20px 12px;
+  }}
+  .moments-section {{
+    border-top: 1px solid var(--border);
+    padding: 16px 20px;
+    background: #fafbfc;
+  }}
+  .moments-label {{
+    font-family: sans-serif;
+    font-size: 10px;
+    font-weight: bold;
+    color: var(--muted);
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+    text-transform: uppercase;
+  }}
+  .moment {{
+    border-left: 3px solid #ccc;
+    padding: 10px 14px;
+    margin-bottom: 10px;
+    background: white;
+    border-radius: 0 6px 6px 0;
+  }}
+  .moment:last-child {{ margin-bottom: 0; }}
+  .moment-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }}
+  .moment-badge {{
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    color: white;
+    font-family: sans-serif;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+  }}
+  .moment-text {{ font-size: 13px; line-height: 1.7; color: #222; margin-bottom: 4px; }}
+  .moment-speaker {{ font-family: sans-serif; font-size: 12px; color: var(--muted); font-style: italic; display: block; margin-top: 4px; }}
+  .moment-context {{ font-family: sans-serif; font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; border-top: 1px dashed var(--border); padding-top: 6px; }}
+  .no-moments {{ font-family: sans-serif; font-size: 12px; color: var(--muted); font-style: italic; }}
+  .empty-state {{
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--muted);
+    font-family: sans-serif;
+  }}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="logo-mark">P</div>
+    <div>
+      <div class="logo-text">Podcast Intelligence Dashboard</div>
+      <div class="logo-sub">Political Media Monitor</div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <a href="/" class="nav-link">Overview</a>
+    <a href="/right" class="nav-link">Right-Wing</a>
+    <a href="/campaign" class="nav-link active">Campaign Intel</a>
+  </div>
+</header>
+
+<div class="main">
+  <div class="page-title">🎯 Campaign Intelligence — Last 72 Hours</div>
+  <div class="page-subtitle">
+    All podcast episodes from the last 72 hours surfaced for <strong>cruelty</strong> and <strong>affordability</strong> campaign themes.
+    Includes notable quotes, attacks, messaging opportunities, and narrative frames relevant to these themes.
+    Updated: {datetime.now().strftime('%B %d, %Y at %H:%M UTC')}
+  </div>
+
+  <div class="theme-legend">
+    <div class="legend-item">
+      <div class="legend-dot" style="background:#7c1d1d;"></div>
+      <span class="legend-label">CRUELTY</span>
+      <span class="legend-desc">— cuts, harm, suffering, vulnerable populations, inhumane policy</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:#1a3a5c;"></div>
+      <span class="legend-label">AFFORDABILITY</span>
+      <span class="legend-desc">— cost of living, housing, healthcare, wages, corporate profits</span>
+    </div>
+  </div>
+
+  {body}
+</div>
+</body>
+</html>"""
+
+
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
 def build_dashboard_html(stats, topics, volume, attacks, opps):
     topic_labels = [t[0] for t in topics[:12]]
@@ -382,9 +937,16 @@ def build_dashboard_html(stats, topics, volume, attacks, opps):
       <div class="logo-sub">Political Media Monitor</div>
     </div>
   </div>
-  <div class="header-right">
-    <span class="live-dot"></span>
-    Last updated: {datetime.now().strftime('%b %d, %Y %H:%M')} UTC
+  <div style="display:flex;align-items:center;gap:28px;">
+    <nav style="display:flex;gap:20px;">
+      <a href="/" style="color:white;font-family:sans-serif;font-size:13px;text-decoration:none;border-bottom:2px solid var(--red);padding-bottom:2px;">Overview</a>
+      <a href="/right" style="color:#a8cce0;font-family:sans-serif;font-size:13px;text-decoration:none;">Right-Wing</a>
+      <a href="/campaign" style="color:#a8cce0;font-family:sans-serif;font-size:13px;text-decoration:none;">🎯 Campaign Intel</a>
+    </nav>
+    <div class="header-right">
+      <span class="live-dot"></span>
+      {datetime.now().strftime('%b %d, %Y %H:%M')} UTC
+    </div>
   </div>
 </header>
 
@@ -502,6 +1064,39 @@ def build_dashboard_html(stats, topics, volume, attacks, opps):
         {opps_html if opps_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No opportunities found yet. Run analyzer to populate.</p>'}
       </div>
     </div>
+  </div>
+
+  <!-- Campaign Intel CTA -->
+  <div style="
+    background: linear-gradient(135deg, #1a3a5c 0%, #7c1d1d 100%);
+    border-radius: 12px;
+    padding: 28px 32px;
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  ">
+    <div>
+      <div style="color:white;font-size:18px;font-weight:bold;margin-bottom:8px;">🎯 Campaign Intelligence: Cruelty &amp; Affordability</div>
+      <div style="color:#a8cce0;font-family:sans-serif;font-size:13px;line-height:1.6;">
+        View all episodes from the last 72 hours filtered for cruelty and affordability signals —
+        including notable quotes, attacks, narrative frames, and direct links to source audio.
+      </div>
+    </div>
+    <a href="/campaign" style="
+      background: white;
+      color: #1a3a5c;
+      font-family: sans-serif;
+      font-size: 13px;
+      font-weight: bold;
+      padding: 12px 24px;
+      border-radius: 8px;
+      text-decoration: none;
+      white-space: nowrap;
+      flex-shrink: 0;
+    ">View Campaign Intel →</a>
   </div>
 
 </div>
@@ -823,7 +1418,11 @@ def build_right_dashboard_html(data):
       <div class="logo-sub">Political Media Intelligence</div>
     </div>
   </div>
-  <a href="/" class="nav-link">← All Podcasts</a>
+  <nav style="display:flex;gap:20px;align-items:center;">
+    <a href="/" class="nav-link">Overview</a>
+    <a href="/right" class="nav-link" style="color:white;font-weight:bold;border-bottom:2px solid #ff6666;padding-bottom:2px;">Right-Wing</a>
+    <a href="/campaign" class="nav-link">🎯 Campaign Intel</a>
+  </nav>
 </header>
 
 <div class="main">
@@ -937,10 +1536,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        
+
         if parsed.path == "/right":
             data = get_right_wing_data()
             html = build_right_dashboard_html(data)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
+
+        elif parsed.path == "/campaign":
+            qs = parse_qs(parsed.query)
+            hours = int(qs.get("hours", ["72"])[0])
+            episodes = get_campaign_intelligence(hours=hours)
+            html = build_campaign_html(episodes, hours=hours)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
