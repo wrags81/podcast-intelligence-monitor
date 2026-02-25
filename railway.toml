@@ -1,11 +1,6 @@
 [build]
 builder = "nixpacks"
 
-[[services]]
-name = "web"
-startCommand = "python dashboard.py"
-
-[[services]]
-name = "cron"
-startCommand = "python monitor.py run-all --since-hours 26"
-cronSchedule = "30 10 * * *"
+[deploy]
+startCommand = "python seed_db.py && python dashboard.py"
+restartPolicyType = "on_failure"
