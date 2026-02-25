@@ -115,6 +115,41 @@ def get_daily_volume(days=14):
     except Exception:
         return {}
 
+def get_all_episodes(hours=None):
+    """All episodes across all leans, with parsed analysis. hours=None means all time."""
+    try:
+        time_clause = f"AND fetched_at > datetime('now', '-{hours} hours')" if hours else ""
+        with get_conn() as conn:
+            rows = conn.execute(f"""
+                SELECT podcast_name, lean, title, published, audio_url, analysis, fetched_at
+                FROM episodes
+                WHERE analysis IS NOT NULL
+                {time_clause}
+                ORDER BY fetched_at DESC
+                LIMIT 100
+            """).fetchall()
+
+        episode_list = []
+        for row in rows:
+            try:
+                a = json.loads(row["analysis"])
+            except Exception:
+                continue
+            episode_list.append({
+                "podcast": row["podcast_name"],
+                "lean": row["lean"],
+                "title": row["title"] or "(Untitled)",
+                "published": (row["published"] or row["fetched_at"] or "")[:16],
+                "audio_url": row["audio_url"] or "",
+                "synopsis": a.get("synopsis", "") or a.get("one_liner", ""),
+                "threat": a.get("threat_level", "low"),
+                "topics": (a.get("key_topics") or [])[:4],
+                "attacks": (a.get("political_attacks") or [])[:2],
+            })
+        return episode_list
+    except Exception:
+        return []
+
 def get_attacks(hours=None):
     """Recent political attacks from right-wing podcasts. hours=None means all time."""
     try:
@@ -811,14 +846,18 @@ def build_campaign_html(episodes, hours=72):
 
 
 # ── HTML Dashboard ─────────────────────────────────────────────────────────────
-def _timeframe_tabs(base_url, current_hours, accent_color="#e8333c"):
-    """Render 24h / 72h / 7d / All Time tab strip."""
-    tabs = [("24h", 24), ("72h", 72), ("7 days", 168), ("All Time", None)]
+def _timeframe_tabs(base_url, current_hours, accent_color="#e8333c", include_all=False):
+    """Render 24h / 72h / 7d (and optionally All Time) tab strip."""
+    tabs = [("24h", 24), ("72h", 72), ("7 days", 168)]
+    if include_all:
+        tabs.append(("All Time", None))
+    # Default active tab: 72h if nothing selected and include_all is False
+    effective_current = current_hours if (current_hours is not None or include_all) else 72
     html = '<div style="display:flex;gap:6px;align-items:center;margin-bottom:20px;flex-wrap:wrap;">'
     html += '<span style="font-family:sans-serif;font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:1px;margin-right:6px;">Show:</span>'
     for label, h in tabs:
         url = f"{base_url}?hours={h}" if h else base_url
-        is_active = current_hours == h
+        is_active = effective_current == h
         if is_active:
             style = f"background:{accent_color};color:white;border:1px solid {accent_color};"
         else:
@@ -839,10 +878,15 @@ def _hours_label(hours):
         return "7 days"
     return f"{hours}h"
 
-def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
+def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None, episodes=None):
     topic_labels = [t[0] for t in topics[:12]]
     topic_values = [t[1] for t in topics[:12]]
-    
+    if episodes is None:
+        episodes = []
+
+    # Default to 72h if no selection made
+    effective_hours = hours if hours is not None else 72
+
     days_sorted = sorted(volume.keys())
     vol_labels = days_sorted[-14:]
     vol_left = [volume.get(d, {}).get("left", 0) for d in vol_labels]
@@ -852,6 +896,9 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
     # Threat badge colors
     def threat_color(level):
         return {"high": "#e8333c", "medium": "#f0a500", "low": "#2a9d8f"}.get(level, "#888")
+
+    def lean_color(lean):
+        return {"left": "#2a9d8f", "right": "#e8333c", "neutral": "#555"}.get(lean, "#888")
 
     attacks_html = ""
     for a in attacks[:15]:
@@ -869,12 +916,43 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
 
     opps_html = ""
     for o in opps:
-        lean_color = {"left": "#2a9d8f", "right": "#e8333c", "neutral": "#555"}.get(o["lean"], "#888")
+        lc = lean_color(o["lean"])
         opps_html += f"""
         <div class="opp-item">
-          <span class="lean-tag" style="background:{lean_color};">{o['lean']}</span>
+          <span class="lean-tag" style="background:{lc};">{o['lean']}</span>
           <span class="opp-source">{o['podcast']}</span>
           <span class="opp-text">{o['opp']}</span>
+        </div>"""
+
+    episodes_html = ""
+    for ep in episodes:
+        tc = threat_color(ep["threat"])
+        lc = lean_color(ep["lean"])
+        topics_str = " · ".join(ep["topics"]) if ep["topics"] else ""
+        link_html = (
+            f'<a href="{ep["audio_url"]}" class="ep-feed-link" target="_blank" rel="noopener">🔗 Listen</a>'
+            if ep["audio_url"] else ""
+        )
+        attacks_preview = ""
+        if ep.get("attacks"):
+            attacks_preview = f'<div class="ep-feed-attacks">⚡ {ep["attacks"][0]}</div>'
+        episodes_html += f"""
+        <div class="ep-feed-row">
+          <div class="ep-feed-header">
+            <div class="ep-feed-meta-left">
+              <span class="badge" style="background:{lc};">{ep['lean'].upper()}</span>
+              <span class="badge" style="background:{tc};">{ep['threat'].upper()}</span>
+              <strong class="ep-feed-show">{ep['podcast']}</strong>
+            </div>
+            <div class="ep-feed-meta-right">
+              <span class="ep-feed-date">📅 {ep['published'] or ''}</span>
+              {link_html}
+            </div>
+          </div>
+          <div class="ep-feed-title">"{ep['title']}"</div>
+          {f'<div class="ep-feed-topics">{topics_str}</div>' if topics_str else ''}
+          {f'<div class="ep-feed-synopsis">{ep["synopsis"]}</div>' if ep.get("synopsis") else ''}
+          {attacks_preview}
         </div>"""
 
     return f"""<!DOCTYPE html>
@@ -1021,7 +1099,22 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
   .scrollable::-webkit-scrollbar {{ width: 4px; }}
   .scrollable::-webkit-scrollbar-track {{ background: var(--bg); }}
   .scrollable::-webkit-scrollbar-thumb {{ background: #ccc; border-radius: 4px; }}
-  
+
+  /* Episode feed */
+  .ep-feed-row {{ padding: 14px 0; border-bottom: 1px solid var(--border); }}
+  .ep-feed-row:last-child {{ border-bottom: none; }}
+  .ep-feed-header {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; }}
+  .ep-feed-meta-left {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }}
+  .ep-feed-meta-right {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+  .ep-feed-show {{ font-family: sans-serif; font-size: 12px; }}
+  .ep-feed-date {{ font-family: sans-serif; font-size: 11px; color: var(--muted); }}
+  .ep-feed-link {{ font-family: sans-serif; font-size: 11px; color: var(--navy); text-decoration: none; font-weight: bold; padding: 2px 8px; border: 1px solid var(--navy); border-radius: 4px; white-space: nowrap; }}
+  .ep-feed-link:hover {{ background: var(--navy); color: white; }}
+  .ep-feed-title {{ font-size: 13px; font-weight: bold; color: var(--navy); margin-bottom: 3px; }}
+  .ep-feed-topics {{ font-family: sans-serif; font-size: 11px; color: var(--muted); margin-bottom: 3px; }}
+  .ep-feed-synopsis {{ font-size: 12px; color: #555; line-height: 1.6; margin-bottom: 3px; }}
+  .ep-feed-attacks {{ font-family: sans-serif; font-size: 11px; color: var(--red); line-height: 1.5; margin-top: 4px; }}
+
   /* Refresh indicator */
   .live-dot {{ width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pulse 2s infinite; display: inline-block; margin-right: 6px; }}
   @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.4; }} }}
@@ -1146,7 +1239,7 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
   </div>
 
   <p class="section-label">Intelligence Feed</p>
-  {_timeframe_tabs("/", hours)}
+  {_timeframe_tabs("/", effective_hours)}
 
   <div class="grid-2">
     <!-- Right-wing attacks -->
@@ -1154,7 +1247,7 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
       <div class="panel-header">
         <div class="panel-dot"></div>
         <div>
-          <div class="panel-title">🚨 Right-Wing Attacks ({_hours_label(hours)})</div>
+          <div class="panel-title">🚨 Right-Wing Attacks ({_hours_label(effective_hours)})</div>
           <div class="panel-subtitle">Attacks requiring counter-messaging</div>
         </div>
       </div>
@@ -1168,13 +1261,27 @@ def build_dashboard_html(stats, topics, volume, attacks, opps, hours=None):
       <div class="panel-header">
         <div class="panel-dot" style="background:#2a9d8f;"></div>
         <div>
-          <div class="panel-title">💡 Messaging Opportunities ({_hours_label(hours)})</div>
+          <div class="panel-title">💡 Messaging Opportunities ({_hours_label(effective_hours)})</div>
           <div class="panel-subtitle">Issues to go on offense with</div>
         </div>
       </div>
       <div class="panel-body scrollable">
         {opps_html if opps_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No opportunities found for this timeframe.</p>'}
       </div>
+    </div>
+  </div>
+
+  <p class="section-label">Episode Feed</p>
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-dot" style="background:#2c5f8a;"></div>
+      <div>
+        <div class="panel-title">📻 All Episodes — {_hours_label(effective_hours)}</div>
+        <div class="panel-subtitle">All podcasts, most recent first · dates, links, threat level, synopsis</div>
+      </div>
+    </div>
+    <div class="panel-body scrollable" style="max-height:640px;">
+      {episodes_html if episodes_html else '<p style="color:#888;font-family:sans-serif;font-size:13px;">No episodes found for this timeframe.</p>'}
     </div>
   </div>
 
@@ -1676,12 +1783,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode())
 
         elif parsed.path == "/" or parsed.path == "/dashboard":
+            # Default to 72h if no timeframe selected on overview
+            overview_hours = hours if hours is not None else 72
             stats = get_stats()
             topics = get_trending_topics()
             volume = get_daily_volume()
-            attacks = get_attacks(hours=hours)
-            opps = get_opportunities(hours=hours)
-            html = build_dashboard_html(stats, topics, volume, attacks, opps, hours=hours)
+            attacks = get_attacks(hours=overview_hours)
+            opps = get_opportunities(hours=overview_hours)
+            all_eps = get_all_episodes(hours=overview_hours)
+            html = build_dashboard_html(stats, topics, volume, attacks, opps, hours=overview_hours, episodes=all_eps)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
