@@ -947,7 +947,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 def main():
-    port = int(os.environ.get("DASHBOARD_PORT", 8080))
+    port = int(os.environ.get("PORT", os.environ.get("DASHBOARD_PORT", 8080)))
     print(f"\n🎙  Podcast Intelligence Dashboard")
     print(f"    http://localhost:{port}")
     print(f"    Press Ctrl+C to stop\n")
